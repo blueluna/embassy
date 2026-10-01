@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel::{Channel, Receiver};
 use embassy_sync::pubsub::{PubSubChannel, Subscriber};
 
 use crate::structs::BssInfo;
@@ -294,6 +295,12 @@ pub type EventSubscriber<'a> = Subscriber<'a, NoopRawMutex, Message, 2, 1, 1>;
 pub struct Events {
     pub queue: EventQueue,
     pub mask: SharedEventMask,
+    /// Received action frames. Kept apart from `queue`, which only holds two
+    /// messages and would push out the events `join` and `scan` wait for.
+    pub action_frames: Channel<NoopRawMutex, ActionFrame, 2>,
+    /// Whether `ACTION_FRAME_RX` events go to `action_frames`. Not part of
+    /// `mask`, which `join` and `scan` clear when they finish.
+    pub action_frame_rx: Cell<bool>,
 }
 
 impl Events {
@@ -301,7 +308,45 @@ impl Events {
         Self {
             queue: EventQueue::new(),
             mask: SharedEventMask::new(),
+            action_frames: Channel::new(),
+            action_frame_rx: Cell::new(false),
         }
+    }
+}
+
+/// Longest action frame body passed up. GAS servers fragment at 1400 octets.
+pub const ACTION_FRAME_CAPACITY: usize = 1536;
+
+/// Receiving end of the action frame queue, see [`crate::Control::action_frames`].
+pub type ActionFrameReceiver<'a> = Receiver<'a, NoopRawMutex, ActionFrame, 2>;
+
+/// An action frame the firmware passed up in an `ACTION_FRAME_RX` event.
+#[derive(Clone)]
+pub struct ActionFrame {
+    /// Transmitter address.
+    pub source: [u8; 6],
+    /// Channel the frame arrived on.
+    pub channel: u8,
+    /// Received signal strength in dBm.
+    pub rssi: i32,
+    /// Frame body, starting at the Category octet.
+    pub body: heapless::Vec<u8, ACTION_FRAME_CAPACITY>,
+}
+
+impl ActionFrame {
+    /// Event data is a `wl_event_rx_frame_data` header - version, chanspec,
+    /// rssi, mactime and rate, all big endian - followed by the frame body.
+    /// The transmitter is in the event header.
+    pub(crate) fn parse(source: [u8; 6], data: &[u8]) -> Option<Self> {
+        let (header, body) = data.split_at_checked(16)?;
+        let chanspec = u16::from_be_bytes([header[2], header[3]]);
+        Some(Self {
+            source,
+            // The low octet of a chanspec is the channel number.
+            channel: chanspec as u8,
+            rssi: i32::from_be_bytes([header[4], header[5], header[6], header[7]]),
+            body: heapless::Vec::from_slice(body).ok()?,
+        })
     }
 }
 

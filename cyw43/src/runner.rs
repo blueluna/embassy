@@ -1211,6 +1211,21 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                     );
                 }
 
+                if event_type == Event::ACTION_FRAME_RX {
+                    if self.events.action_frame_rx.get() {
+                        let source = event_packet.msg.addr;
+                        match events::ActionFrame::parse(source, evt_data) {
+                            Some(frame) => {
+                                if self.events.action_frames.try_send(frame).is_err() {
+                                    warn!("action frame dropped, receiver not keeping up");
+                                }
+                            }
+                            None => warn!("action frame event too short or too long"),
+                        }
+                    }
+                    return;
+                }
+
                 if self.events.mask.is_enabled(event_type) {
                     let status = event_packet.msg.status;
                     let reason = event_packet.msg.reason;

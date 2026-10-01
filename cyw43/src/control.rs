@@ -8,7 +8,7 @@ use embassy_net_driver_channel::driver::HardwareAddress;
 use embassy_time::{Duration, Timer};
 
 use crate::consts::*;
-use crate::events::{Event, EventSubscriber, Events};
+use crate::events::{ActionFrameReceiver, Event, EventSubscriber, Events};
 use crate::fmt::Bytes;
 use crate::ioctl::{IoctlState, IoctlType};
 use crate::structs::*;
@@ -26,6 +26,20 @@ pub enum JoinError {
     JoinFailure(u8),
     /// Authentication failure for a secure network.
     AuthenticationFailure,
+}
+
+/// Action frame transmit errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ActionFrameError {
+    /// The body does not fit the firmware's 1040 octet action frame buffer.
+    TooLong,
+    /// The firmware reported a failure, usually no acknowledgement from the
+    /// receiver. Contains the `ACTION_FRAME_COMPLETE` status.
+    Failed(u32),
+    /// No `ACTION_FRAME_COMPLETE` event arrived. The firmware probably rejected
+    /// the `actframe` iovar; the runner logs the ioctl error.
+    Timeout,
 }
 
 /// Control driver.
@@ -667,7 +681,9 @@ impl<'a> Control<'a> {
         self.set_iovar(name, &buf).await
     }
 
-    async fn set_iovar_u32(&mut self, name: &str, val: u32) {
+    /// Set a firmware variable (iovar) to a `u32`. Meant for experiments with
+    /// settings this driver has no method for, such as `mpc`.
+    pub async fn set_iovar_u32(&mut self, name: &str, val: u32) {
         self.set_iovar(name, &val.to_le_bytes()).await
     }
 
@@ -746,6 +762,89 @@ impl<'a> Control<'a> {
         ioctl.defuse();
 
         resp_len
+    }
+
+    /// Tune the radio to a 2.4 GHz channel. Only meaningful while neither
+    /// associated nor running an AP, e.g. to listen for action frames.
+    pub async fn set_channel(&mut self, channel: u8) {
+        self.ioctl_set_u32(Ioctl::SetChannel, 0, channel.into()).await;
+    }
+
+    /// Start or stop passing received action frames to [`Control::action_frames`].
+    /// Stopping drops any frames still queued.
+    pub fn set_action_frame_rx(&mut self, enabled: bool) {
+        self.events.action_frame_rx.set(enabled);
+        if !enabled {
+            self.events.action_frames.clear();
+        }
+    }
+
+    /// Received action frames, once enabled with [`Control::set_action_frame_rx`].
+    /// The receiver does not borrow `self`, so frames can be awaited alongside
+    /// other control calls. Two frames are buffered; later ones are dropped.
+    pub fn action_frames(&self) -> ActionFrameReceiver<'a> {
+        self.events.action_frames.receiver()
+    }
+
+    /// Transmit an action frame and wait for it to be acknowledged.
+    ///
+    /// `body` starts at the Category octet; the firmware builds the 802.11
+    /// header from `destination` and `bssid` (use `ff:ff:ff:ff:ff:ff` for a
+    /// Public Action frame outside a BSS). The frame goes out on `channel`, and
+    /// the radio stays there for `dwell_ms` afterwards to catch a response.
+    pub async fn send_action_frame(
+        &mut self,
+        destination: [u8; 6],
+        bssid: [u8; 6],
+        channel: u8,
+        dwell_ms: u32,
+        body: &[u8],
+    ) -> Result<(), ActionFrameError> {
+        // wl_af_params_t: channel, dwell time, BSSID and padding, then a
+        // wl_action_frame_t of destination, length, packet ID and data.
+        // Infineon's WHD sizes the data at 1040 octets. Linux brcmfmac uses
+        // 1800, but a control message that long never gets an answer from the
+        // CYW43439 firmware.
+        const DATA_OFFSET: usize = 4 + 4 + 6 + 2 + 6 + 2 + 4;
+        const ACTION_FRAME_SIZE: usize = 1040;
+        const PARAMS_SIZE: usize = DATA_OFFSET + ACTION_FRAME_SIZE;
+
+        if body.len() > ACTION_FRAME_SIZE {
+            return Err(ActionFrameError::TooLong);
+        }
+
+        let mut params = [0u8; PARAMS_SIZE];
+        params[0..4].copy_from_slice(&u32::from(channel).to_le_bytes());
+        params[4..8].copy_from_slice(&dwell_ms.to_le_bytes());
+        params[8..14].copy_from_slice(&bssid);
+        params[16..22].copy_from_slice(&destination);
+        params[22..24].copy_from_slice(&(body.len() as u16).to_le_bytes());
+        params[DATA_OFFSET..][..body.len()].copy_from_slice(body);
+
+        let completions = [Event::ACTION_FRAME_COMPLETE, Event::ACTION_FRAME_OFF_CHAN_COMPLETE];
+        self.events.mask.enable(&completions);
+        let mut subscriber = self.events.queue.subscriber().unwrap();
+
+        let status = embassy_time::with_timeout(Duration::from_secs(1), async {
+            self.set_iovar_v::<{ "actframe".len() + 1 + PARAMS_SIZE }>("actframe", &params)
+                .await;
+            loop {
+                let message = subscriber.next_message_pure().await;
+                if message.header.event_type == Event::ACTION_FRAME_COMPLETE {
+                    return message.header.status;
+                }
+            }
+        })
+        .await;
+
+        drop(subscriber);
+        self.events.mask.disable(&completions);
+
+        match status {
+            Ok(0) => Ok(()),
+            Ok(status) => Err(ActionFrameError::Failed(status)),
+            Err(_) => Err(ActionFrameError::Timeout),
+        }
     }
 
     /// Start a wifi scan
